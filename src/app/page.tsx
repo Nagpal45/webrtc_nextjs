@@ -1,113 +1,226 @@
-import Image from "next/image";
+"use client";
+import React, { useRef, useEffect, MutableRefObject } from 'react';
+import io, { Socket } from 'socket.io-client';
 
-export default function Home() {
+const servers: RTCConfiguration = {
+  iceServers: [
+    {
+      urls: 'stun:stun.l.google.com:19302'
+    }
+  ]
+};
+
+export default function Home(): JSX.Element {
+  let localStream: MediaStream | null = null;
+  let peerConnection: RTCPeerConnection | null = null;
+  let isCaller = false;
+
+  const socketRef: MutableRefObject<Socket | null> = useRef(null);
+  const localVideoRef: MutableRefObject<HTMLVideoElement | null> = useRef(null);
+  const remoteVideoRef: MutableRefObject<HTMLVideoElement | null> = useRef(null);
+  const chatInputRef: MutableRefObject<HTMLInputElement | null> = useRef(null);
+  const chatWindowRef: MutableRefObject<HTMLDivElement | null> = useRef(null);
+
+  useEffect(() => {
+    socketRef.current = io('http://localhost:3000');
+
+    socketRef.current.on('answer', () => {
+      createPeerConnection();
+      if (localStream) {
+        localStream.getTracks().forEach(track => {
+          if (!peerConnection?.getSenders().some(sender => sender.track === track)) {
+            peerConnection?.addTrack(track, localStream!);
+          }
+        });
+      }
+    });
+
+    socketRef.current.on('message', async (message: any) => {
+      if (!peerConnection) return;
+      if (message.type === 'offer') {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socketRef.current?.emit('message', { type: 'answer', answer: peerConnection.localDescription });
+      } else if (message.type === 'answer') {
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+      } else if (message.type === 'candidate') {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+      }
+    });
+
+    socketRef.current.on('end', () => {
+      endCall();
+    });
+
+    socketRef.current.on('screenShare', () => {
+      startScreenShare();
+    });
+
+    socketRef.current.on('chatMessage', (message: string) => {
+      appendChatMessage(`Remote: ${message}`);
+    });
+
+    return () => {
+      if (peerConnection) {
+        peerConnection.close();
+      }
+      if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+      }
+      socketRef.current?.disconnect();
+    };
+  }, []);
+
+  async function startVideo(): Promise<void> {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStream;
+      }
+      socketRef.current?.emit('startScreenSharing');
+    } catch (error) {
+      console.error('Error accessing media devices.', error);
+    }
+  }
+
+  async function startScreenShare(): Promise<void> {
+    try {
+      localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStream;
+        localVideoRef.current.style.width = '100%';
+        localVideoRef.current.style.height = '100%';
+      }
+
+      if (peerConnection && localStream) {
+        localStream.getTracks().forEach(track => {
+          if (!peerConnection!.getSenders().some(sender => sender.track === track)) {
+            peerConnection!.addTrack(track, localStream!);
+          }
+        });
+      
+        const offer = await peerConnection!.createOffer();
+        await peerConnection!.setLocalDescription(offer);
+        socketRef.current?.emit('message', { type: 'offer', offer: peerConnection!.localDescription });
+      }      
+
+    } catch (error) {
+      console.error('Error accessing media devices.', error);
+    }
+  }
+
+  function call(): void {
+    isCaller = true;
+    socketRef.current?.emit('call');
+  }
+
+  function answer(): void {
+    isCaller = false;
+    createPeerConnection();
+    if (localStream) {
+      localStream.getTracks().forEach(track => {
+        if (!peerConnection?.getSenders().some(sender => sender.track === track)) {
+          peerConnection?.addTrack(track, localStream!);
+        }
+      });
+    }
+    socketRef.current?.emit('answer');
+  }
+
+  function endCall(): void {
+    if (peerConnection) {
+      peerConnection.close();
+      peerConnection = null;
+    }
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+      localStream = null;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = null;
+      }
+    }
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
+    socketRef.current?.emit('end');
+  }
+
+  function createPeerConnection(): void {
+    peerConnection = new RTCPeerConnection(servers);
+
+    peerConnection.onicecandidate = event => {
+      if (event.candidate) {
+        socketRef.current?.emit('message', { type: 'candidate', candidate: event.candidate });
+      }
+    };
+
+    peerConnection.ontrack = event => {
+      if (event.streams && event.streams[0]) {
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = event.streams[0];
+        }
+      }
+    };
+
+    if (isCaller && localStream) {
+      localStream.getTracks().forEach(track => {
+        if (!peerConnection?.getSenders().some(sender => sender.track === track)) {
+          peerConnection?.addTrack(track, localStream!);
+        }
+      });
+      peerConnection.createOffer()
+        .then(offer => peerConnection?.setLocalDescription(offer))
+        .then(() => {
+          socketRef.current?.emit('message', { type: 'offer', offer: peerConnection?.localDescription });
+        });
+    }
+  }
+
+  function sendMessage(): void {
+    const message = chatInputRef.current?.value;
+    if (message) {
+      socketRef.current?.emit('chatMessage', message);
+      appendChatMessage(`You: ${message}`);
+      if (chatInputRef.current) {
+        chatInputRef.current.value = '';
+      }
+    }
+  }
+
+  function appendChatMessage(message: string): void {
+    const messageElement = document.createElement('div');
+    messageElement.textContent = message;
+    chatWindowRef.current?.appendChild(messageElement);
+    if (chatWindowRef.current) {
+      chatWindowRef.current.scrollTop = chatWindowRef.current.scrollHeight;
+    }
+  }
+
   return (
-    <main className="flex min-h-screen flex-col items-center justify-between p-24">
-      <div className="z-10 w-full max-w-5xl items-center justify-between font-mono text-sm lg:flex">
-        <p className="fixed left-0 top-0 flex w-full justify-center border-b border-gray-300 bg-gradient-to-b from-zinc-200 pb-6 pt-8 backdrop-blur-2xl dark:border-neutral-800 dark:bg-zinc-800/30 dark:from-inherit lg:static lg:w-auto  lg:rounded-xl lg:border lg:bg-gray-200 lg:p-4 lg:dark:bg-zinc-800/30">
-          Get started by editing&nbsp;
-          <code className="font-mono font-bold">src/app/page.tsx</code>
-        </p>
-        <div className="fixed bottom-0 left-0 flex h-48 w-full items-end justify-center bg-gradient-to-t from-white via-white dark:from-black dark:via-black lg:static lg:size-auto lg:bg-none">
-          <a
-            className="pointer-events-none flex place-items-center gap-2 p-8 lg:pointer-events-auto lg:p-0"
-            href="https://vercel.com?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            By{" "}
-            <Image
-              src="/vercel.svg"
-              alt="Vercel Logo"
-              className="dark:invert"
-              width={100}
-              height={24}
-              priority
-            />
-          </a>
-        </div>
+    <div>
+      <h1>WebRTC Screen and Video Sharing</h1>
+      <div>
+        <button id="startVideo" onClick={startVideo}>Start Video</button>
+        <button id="startScreenShare" onClick={startScreenShare}>Start Screen Share</button>
+        <button id="call" onClick={call}>Call</button>
+        <button id="answer" onClick={answer}>Answer</button>
+        <button id="end" onClick={endCall}>End</button>
       </div>
-
-      <div className="relative z-[-1] flex place-items-center before:absolute before:h-[300px] before:w-full before:-translate-x-1/2 before:rounded-full before:bg-gradient-radial before:from-white before:to-transparent before:blur-2xl before:content-[''] after:absolute after:-z-20 after:h-[180px] after:w-full after:translate-x-1/3 after:bg-gradient-conic after:from-sky-200 after:via-blue-200 after:blur-2xl after:content-[''] before:dark:bg-gradient-to-br before:dark:from-transparent before:dark:to-blue-700 before:dark:opacity-10 after:dark:from-sky-900 after:dark:via-[#0141ff] after:dark:opacity-40 sm:before:w-[480px] sm:after:w-[240px] before:lg:h-[360px]">
-        <Image
-          className="relative dark:drop-shadow-[0_0_0.3rem_#ffffff70] dark:invert"
-          src="/next.svg"
-          alt="Next.js Logo"
-          width={180}
-          height={37}
-          priority
-        />
+      <div>
+        <h2>Local Stream</h2>
+        <video id="localVideo" autoPlay playsInline ref={localVideoRef}></video>
       </div>
-
-      <div className="mb-32 grid text-center lg:mb-0 lg:w-full lg:max-w-5xl lg:grid-cols-4 lg:text-left">
-        <a
-          href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className="mb-3 text-2xl font-semibold">
-            Docs{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className="m-0 max-w-[30ch] text-sm opacity-50">
-            Find in-depth information about Next.js features and API.
-          </p>
-        </a>
-
-        <a
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className="mb-3 text-2xl font-semibold">
-            Learn{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className="m-0 max-w-[30ch] text-sm opacity-50">
-            Learn about Next.js in an interactive course with&nbsp;quizzes!
-          </p>
-        </a>
-
-        <a
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className="mb-3 text-2xl font-semibold">
-            Templates{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className="m-0 max-w-[30ch] text-sm opacity-50">
-            Explore starter templates for Next.js.
-          </p>
-        </a>
-
-        <a
-          href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className="mb-3 text-2xl font-semibold">
-            Deploy{" "}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className="m-0 max-w-[30ch] text-balance text-sm opacity-50">
-            Instantly deploy your Next.js site to a shareable URL with Vercel.
-          </p>
-        </a>
+      <div>
+        <h2>Remote Stream</h2>
+        <video id="remoteVideo" autoPlay playsInline ref={remoteVideoRef}></video>
       </div>
-    </main>
+      <div>
+        <h2>Chat</h2>
+        <div id="chatWindow" ref={chatWindowRef}></div>
+        <input type="text" id="chatInput" placeholder="Type a message..." ref={chatInputRef} />
+        <button id="sendMessage" onClick={sendMessage}>Send</button>
+      </div>
+    </div>
   );
 }
